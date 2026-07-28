@@ -225,6 +225,9 @@ class ProxyService : Service() {
                 closeAll(closed, socket, webSocket)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (code != 1000) {
+                    reportConnectionFailure(null, "اتصال Worker به تلگرام قطع شد (کد $code${if (reason.isNotEmpty()) " - $reason" else ""})")
+                }
                 closeAll(closed, socket, webSocket)
             }
         })
@@ -246,10 +249,10 @@ class ProxyService : Service() {
 
     private val midSessionErrorShown = AtomicBoolean(false)
 
-    private fun reportConnectionFailure(response: Response?) {
+    private fun reportConnectionFailure(response: Response?, overrideMessage: String? = null) {
         if (!midSessionErrorShown.compareAndSet(false, true)) return // فقط یه‌بار در هر فعال‌سازی
 
-        val message = when (response?.code) {
+        val message = overrideMessage ?: when (response?.code) {
             403 -> "کلید مشترک اشتباهه — با کلید AUTH_KEY توی Cloudflare یکی نیست"
             404 -> "آدرس Worker درست نیست یا مسیر /apiws پیدا نشد"
             null -> "اتصال به Worker برقرار نشد — آدرس Worker یا اینترنت رو چک کن"

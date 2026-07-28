@@ -80,7 +80,23 @@ export default {
 		const server = pair[1];
 		server.accept();
 
-		const socket = connect({ hostname: dst, port: 443 });
+		let socket;
+		try {
+			socket = connect({ hostname: dst, port: 443 });
+
+			// --- تست واقعی برقراری اتصال TCP، با timeout ---
+			// بدون این چک، اگه اتصال به سرور تلگرام گیر کنه، Worker تا ابد ساکت
+			// می‌مونه و کاربر فقط "Connecting..." می‌بینه بدون هیچ خطایی.
+			const timeout = new Promise((_, reject) =>
+				setTimeout(() => reject(new Error("connect timeout")), 10000)
+			);
+			await Promise.race([socket.opened, timeout]);
+		} catch (err) {
+			console.error(`tcp connect failed to ${dst}:443 — ${err && err.message}`);
+			try { server.close(1011, "upstream connect failed"); } catch {}
+			return new Response(null, { status: 101, webSocket: client });
+		}
+
 		const tcpReader = socket.readable.getReader();
 		const tcpWriter = socket.writable.getWriter();
 
@@ -88,7 +104,8 @@ export default {
 			try {
 				const real = unwrapPadding(toBytes(event.data));
 				if (real.length > 0) await tcpWriter.write(real);
-			} catch {
+			} catch (err) {
+				console.error(`tcp write failed — ${err && err.message}`);
 				try { server.close(1011, "tcp write failed"); } catch {}
 			}
 		});
@@ -105,7 +122,8 @@ export default {
 					if (done) break;
 					if (value) server.send(wrapWithPadding(value));
 				}
-			} catch {
+			} catch (err) {
+				console.error(`tcp read failed — ${err && err.message}`);
 			} finally {
 				try { server.close(); } catch {}
 				try { tcpReader.releaseLock(); } catch {}
