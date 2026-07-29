@@ -184,7 +184,14 @@ class ProxyService : Service() {
                     val a = ByteArray(len); readFully(input, a)
                     String(a)
                 }
-                else -> { socket.close(); return } // IPv6 not supported
+                0x04 -> { // IPv6
+                    val a = ByteArray(16); readFully(input, a)
+                    java.net.InetAddress.getByAddress(a).hostAddress
+                }
+                else -> {
+                    reportLocalError("درخواست SOCKS5 ناشناخته (ATYP=$atyp) — تلگرام رد شد")
+                    socket.close(); return
+                }
             }
             val portBytes = ByteArray(2)
             readFully(input, portBytes)
@@ -196,12 +203,24 @@ class ProxyService : Service() {
             relayThroughWorker(destHost, socket, input, output)
 
         } catch (e: Exception) {
+            reportLocalError("درخواست محلی SOCKS5 با خطا مواجه شد: ${e.message}")
             try { socket.close() } catch (_: Exception) {}
         }
     }
 
+    /** برای خطاهایی که قبل از رسیدن به Worker (توی همون SOCKS5 محلی) اتفاق می‌افتن. */
+    private fun reportLocalError(message: String) {
+        if (!midSessionErrorShown.compareAndSet(false, true)) return
+        mainHandler.post {
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm?.notify(NOTIF_ID, buildNotification("خطا: $message"))
+    }
+
     private fun relayThroughWorker(destHost: String, socket: Socket, input: InputStream, output: OutputStream) {
-        val url = "wss://$workerHost/apiws?dst=$destHost"
+        val encodedDst = java.net.URLEncoder.encode(destHost, "UTF-8")
+        val url = "wss://$workerHost/apiws?dst=$encodedDst"
         val request = Request.Builder()
             .url(url)
             .addHeader("X-Auth-Key", authKey)
