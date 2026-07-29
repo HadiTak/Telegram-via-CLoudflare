@@ -28,16 +28,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
-/**
- * Local SOCKS5 server. Telegram is configured (in its own proxy settings) to
- * connect here. Every connection Telegram makes is forwarded to a Cloudflare
- * Worker over a WebSocket (wss://, never filtered), and the Worker opens the
- * real TCP connection to Telegram's servers on our behalf.
- *
- * هر پیام قبل از ارسال یه padding تصادفی کوچیک می‌گیره تا اندازه‌ی بسته‌ها
- * (که می‌تونه امضای MTProto رو لو بده) نامنظم بشه. این padding فقط روی لینک
- * app<->worker اضافه می‌شه و قبل از رسیدن به تلگرام حذف می‌شه.
- */
 class ProxyService : Service() {
 
     enum class State { STOPPED, CONNECTING, RUNNING }
@@ -100,7 +90,6 @@ class ProxyService : Service() {
         return START_STICKY
     }
 
-    /** قبل از هر چیز، یه درخواست ساده به /check می‌فرسته تا مطمئن بشه کلید و آدرس درستن. */
     private fun verifyThenStart() {
         val checkUrl = "https://$workerHost/check"
         try {
@@ -151,7 +140,21 @@ class ProxyService : Service() {
                 pool.execute { handleClient(client) }
             }
         } catch (e: Exception) {
-            // server socket closed on stop, or bind failed (e.g. port in use)
+            if (state == State.RUNNING) {
+                // این یعنی سرور SOCKS5 محلی واقعاً نتونست بالا بیاد (مثلاً پورت قبلاً اشغال بوده)
+                // ولی وضعیت اشتباهاً "فعال" مونده بود؛ اینجا درستش می‌کنیم.
+                setState(State.STOPPED)
+                mainHandler.post {
+                    Toast.makeText(
+                        this,
+                        "سرور محلی SOCKS5 بالا نیومد (پورت $localPort شاید قبلاً استفاده شده) — ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+            // else: عادیه، یعنی خودمون داشتیم سرویس رو متوقف می‌کردیم
         }
     }
 
@@ -160,31 +163,29 @@ class ProxyService : Service() {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // SOCKS5 greeting
             val greeting = ByteArray(2)
             if (readFully(input, greeting) != 2) { socket.close(); return }
             val nMethods = greeting[1].toInt() and 0xFF
             val methods = ByteArray(nMethods)
             readFully(input, methods)
-            output.write(byteArrayOf(0x05, 0x00)) // no-auth accepted
+            output.write(byteArrayOf(0x05, 0x00))
             output.flush()
 
-            // SOCKS5 connect request
             val head = ByteArray(4)
             if (readFully(input, head) != 4) { socket.close(); return }
             val atyp = head[3].toInt() and 0xFF
 
             val destHost: String = when (atyp) {
-                0x01 -> { // IPv4
+                0x01 -> {
                     val a = ByteArray(4); readFully(input, a)
                     a.joinToString(".") { (it.toInt() and 0xFF).toString() }
                 }
-                0x03 -> { // domain name
+                0x03 -> {
                     val len = input.read()
                     val a = ByteArray(len); readFully(input, a)
                     String(a)
                 }
-                0x04 -> { // IPv6
+                0x04 -> {
                     val a = ByteArray(16); readFully(input, a)
                     java.net.InetAddress.getByAddress(a).hostAddress
                 }
@@ -196,7 +197,6 @@ class ProxyService : Service() {
             val portBytes = ByteArray(2)
             readFully(input, portBytes)
 
-            // reply: success
             output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
             output.flush()
 
@@ -208,7 +208,6 @@ class ProxyService : Service() {
         }
     }
 
-    /** برای خطاهایی که قبل از رسیدن به Worker (توی همون SOCKS5 محلی) اتفاق می‌افتن. */
     private fun reportLocalError(message: String) {
         if (!midSessionErrorShown.compareAndSet(false, true)) return
         mainHandler.post {
@@ -269,7 +268,7 @@ class ProxyService : Service() {
     private val midSessionErrorShown = AtomicBoolean(false)
 
     private fun reportConnectionFailure(response: Response?, overrideMessage: String? = null) {
-        if (!midSessionErrorShown.compareAndSet(false, true)) return // فقط یه‌بار در هر فعال‌سازی
+        if (!midSessionErrorShown.compareAndSet(false, true)) return
 
         val message = overrideMessage ?: when (response?.code) {
             403 -> "کلید مشترک اشتباهه — با کلید AUTH_KEY توی Cloudflare یکی نیست"
