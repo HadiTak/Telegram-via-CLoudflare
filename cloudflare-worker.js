@@ -41,7 +41,7 @@ function unwrapPadding(data) {
 }
 
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 
 		// --- مسیر تست سریع کلید (بدون websocket، فقط یه GET ساده) ---
@@ -115,7 +115,7 @@ export default {
 			try { socket.close(); } catch {}
 		});
 
-		(async () => {
+		const pump = (async () => {
 			try {
 				while (true) {
 					const { value, done } = await tcpReader.read();
@@ -130,6 +130,10 @@ export default {
 				try { socket.close(); } catch {}
 			}
 		})();
+
+		// بدون این خط، Cloudflare بعد از برگردوندن Response، این کار پس‌زمینه رو
+		// بعد از چند ثانیه قطع می‌کنه (دقیقاً همون چیزی که باعث "Stream was cancelled" می‌شد).
+		ctx.waitUntil(pump);
 
 		return new Response(null, { status: 101, webSocket: client });
 	},
