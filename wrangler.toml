@@ -1,0 +1,11 @@
+name = "tgviaandroid"
+main = "cloudflare-worker.js"
+compatibility_date = "2026-07-29"
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]

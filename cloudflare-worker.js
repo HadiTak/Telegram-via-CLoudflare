@@ -1,6 +1,8 @@
 // این کد رو داخل Cloudflare Worker (Edit code) جایگزین کد پیش‌فرض کنید و Deploy بزنید.
-// Worker از طریق WebSocket به سرور مقصد (dst) روی پورت 443 وصل میشه و بایت‌ها رو
-// در دو جهت پاس میده. برنامه‌ی اندروید دقیقاً با همین مسیر (/apiws?dst=...) صحبت می‌کنه.
+// نکته‌ی مهم: این نسخه از یه Durable Object (کلاس Relay) برای نگه‌داشتن اتصال
+// طولانی‌مدت استفاده می‌کنه، چون یه Worker معمولی بعد از حدود ۳۰ ثانیه اتصال رو
+// قطع می‌کنه (محدودیت پلتفرم Cloudflare، نه باگ کد). بعد از پیست کردن این کد،
+// باید یه Durable Object Binding هم توی تنظیمات Worker اضافه کنید (توضیحش پایین‌تره).
 
 import { connect } from "cloudflare:sockets";
 
@@ -15,10 +17,6 @@ function toBytes(data) {
 }
 
 // --- padding تصادفی ---
-// هر پیام WS یه بایت اول داره که طول padding رو می‌گه، بعد همون مقدار بایت
-// تصادفی، بعد داده‌ی واقعی. این کار اندازه‌ی ثابت و قابل‌تشخیص بسته‌های
-// MTProto رو روی لینک app<->worker به هم می‌ریزه، بدون اینکه به جریان
-// خام MTProto که به سمت تلگرام می‌ره دست بزنه (padding فقط همینجا اضافه/حذف می‌شه).
 const MAX_PAD = 63;
 
 function wrapWithPadding(data) {
@@ -41,11 +39,10 @@ function unwrapPadding(data) {
 }
 
 export default {
-	async fetch(request, env, ctx) {
+	async fetch(request, env) {
 		const url = new URL(request.url);
 
-		// --- مسیر تست سریع کلید (بدون websocket، فقط یه GET ساده) ---
-		// اپ قبل از فعال شدن، اینجا رو صدا می‌زنه تا مطمئن بشه کلید درسته.
+		// --- مسیر تست سریع کلید ---
 		if (url.pathname === "/check") {
 			const providedKey = request.headers.get("X-Auth-Key");
 			if (!env.AUTH_KEY || providedKey !== env.AUTH_KEY) {
@@ -54,20 +51,17 @@ export default {
 			return new Response("ok", { status: 200 });
 		}
 
+		if (url.pathname !== "/apiws") {
+			return new Response("Not found", { status: 404 });
+		}
+
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
 			return new Response("Expected websocket", { status: 426 });
 		}
 
-		// --- احراز هویت با کلید مشترک ---
-		// فقط درخواست‌هایی که هدر X-Auth-Key رو با مقدار درست بفرستن قبول می‌شن.
-		// مقدار درست از یه Secret Variable به اسم AUTH_KEY خونده می‌شه (توی تنظیمات Worker ست می‌کنید).
 		const providedKey = request.headers.get("X-Auth-Key");
 		if (!env.AUTH_KEY || providedKey !== env.AUTH_KEY) {
 			return new Response("Forbidden", { status: 403 });
-		}
-
-		if (url.pathname !== "/apiws") {
-			return new Response("Not found", { status: 404 });
 		}
 
 		const dst = url.searchParams.get("dst");
@@ -75,66 +69,89 @@ export default {
 			return new Response("Missing dst", { status: 400 });
 		}
 
+		// هر اتصال یه Durable Object جدا و مخصوص خودش می‌گیره تا بتونه
+		// مستقل از محدودیت زمانی fetch معمولی، زنده بمونه.
+		const id = env.RELAY.newUniqueId();
+		const stub = env.RELAY.get(id);
+		return stub.fetch(request);
+	},
+};
+
+export class Relay {
+	constructor(state, env) {
+		this.state = state;
+		this.sockets = new Map(); // WebSocket -> { tcpSocket, writer }
+	}
+
+	async fetch(request) {
+		const url = new URL(request.url);
+		const dst = url.searchParams.get("dst");
+
 		const pair = new WebSocketPair();
 		const client = pair[0];
 		const server = pair[1];
-		server.accept();
 
-		let socket;
+		this.state.acceptWebSocket(server);
+
 		try {
-			socket = connect({ hostname: dst, port: 443 });
-
-			// --- تست واقعی برقراری اتصال TCP، با timeout ---
-			// بدون این چک، اگه اتصال به سرور تلگرام گیر کنه، Worker تا ابد ساکت
-			// می‌مونه و کاربر فقط "Connecting..." می‌بینه بدون هیچ خطایی.
+			const tcpSocket = connect({ hostname: dst, port: 443 });
 			const timeout = new Promise((_, reject) =>
 				setTimeout(() => reject(new Error("connect timeout")), 10000)
 			);
-			await Promise.race([socket.opened, timeout]);
+			await Promise.race([tcpSocket.opened, timeout]);
+
+			const writer = tcpSocket.writable.getWriter();
+			this.sockets.set(server, { tcpSocket, writer });
+
+			const reader = tcpSocket.readable.getReader();
+			(async () => {
+				try {
+					while (true) {
+						const { value, done } = await reader.read();
+						if (done) break;
+						if (value) server.send(wrapWithPadding(value));
+					}
+				} catch (err) {
+					console.error(`tcp read failed — ${err && err.message}`);
+				} finally {
+					try { server.close(); } catch {}
+					try { reader.releaseLock(); } catch {}
+					try { tcpSocket.close(); } catch {}
+					this.sockets.delete(server);
+				}
+			})();
 		} catch (err) {
 			console.error(`tcp connect failed to ${dst}:443 — ${err && err.message}`);
 			try { server.close(1011, "upstream connect failed"); } catch {}
-			return new Response(null, { status: 101, webSocket: client });
 		}
 
-		const tcpReader = socket.readable.getReader();
-		const tcpWriter = socket.writable.getWriter();
-
-		server.addEventListener("message", async (event) => {
-			try {
-				const real = unwrapPadding(toBytes(event.data));
-				if (real.length > 0) await tcpWriter.write(real);
-			} catch (err) {
-				console.error(`tcp write failed — ${err && err.message}`);
-				try { server.close(1011, "tcp write failed"); } catch {}
-			}
-		});
-
-		server.addEventListener("close", async () => {
-			try { await tcpWriter.close(); } catch {}
-			try { socket.close(); } catch {}
-		});
-
-		const pump = (async () => {
-			try {
-				while (true) {
-					const { value, done } = await tcpReader.read();
-					if (done) break;
-					if (value) server.send(wrapWithPadding(value));
-				}
-			} catch (err) {
-				console.error(`tcp read failed — ${err && err.message}`);
-			} finally {
-				try { server.close(); } catch {}
-				try { tcpReader.releaseLock(); } catch {}
-				try { socket.close(); } catch {}
-			}
-		})();
-
-		// بدون این خط، Cloudflare بعد از برگردوندن Response، این کار پس‌زمینه رو
-		// بعد از چند ثانیه قطع می‌کنه (دقیقاً همون چیزی که باعث "Stream was cancelled" می‌شد).
-		ctx.waitUntil(pump);
-
 		return new Response(null, { status: 101, webSocket: client });
-	},
-};
+	}
+
+	async webSocketMessage(ws, message) {
+		const entry = this.sockets.get(ws);
+		if (!entry) return;
+		try {
+			const real = unwrapPadding(toBytes(message));
+			if (real.length > 0) {
+				await entry.writer.write(real);
+			}
+		} catch (err) {
+			console.error(`tcp write failed — ${err && err.message}`);
+			try { ws.close(1011, "tcp write failed"); } catch {}
+		}
+	}
+
+	async webSocketClose(ws, code, reason) {
+		const entry = this.sockets.get(ws);
+		if (entry) {
+			try { await entry.writer.close(); } catch {}
+			try { entry.tcpSocket.close(); } catch {}
+			this.sockets.delete(ws);
+		}
+	}
+
+	async webSocketError(ws, error) {
+		await this.webSocketClose(ws, 1011, "error");
+	}
+}
