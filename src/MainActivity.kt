@@ -1,10 +1,7 @@
 package ir.biral.tgrelay
 
 import android.Manifest
-import android.app.AlertDialog
 import android.content.ActivityNotFoundException
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -17,7 +14,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
@@ -27,8 +23,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etPort: EditText
     private lateinit var btnToggle: Button
     private lateinit var btnOpenTelegram: Button
-    private lateinit var btnHelp: Button
-    private lateinit var btnGenKey: Button
     private lateinit var tvStatus: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,8 +35,6 @@ class MainActivity : AppCompatActivity() {
         etPort = findViewById(R.id.etPort)
         btnToggle = findViewById(R.id.btnToggle)
         btnOpenTelegram = findViewById(R.id.btnOpenTelegram)
-        btnHelp = findViewById(R.id.btnHelp)
-        btnGenKey = findViewById(R.id.btnGenKey)
         tvStatus = findViewById(R.id.tvStatus)
 
         etKey.setText(prefs.getString("key", ""))
@@ -51,46 +43,6 @@ class MainActivity : AppCompatActivity() {
 
         btnToggle.setOnClickListener { onToggleClicked() }
         btnOpenTelegram.setOnClickListener { openInTelegram() }
-        btnHelp.setOnClickListener { showHelp() }
-        btnGenKey.setOnClickListener { generateKey() }
-    }
-
-    private fun generateKey() {
-        val bytes = ByteArray(32)
-        SecureRandom().nextBytes(bytes)
-        val key = bytes.joinToString("") { "%02x".format(it) }
-        etKey.setText(key)
-
-        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("AUTH_KEY", key))
-
-        Toast.makeText(this, "کلید ساخته شد و کپی شد — حالا برو توی Cloudflare بهش بچسبونش", Toast.LENGTH_LONG).show()
-    }
-
-    private fun showHelp() {
-        val message = """
-            ۱. یه اکانت رایگان Cloudflare بسازید → Workers & Pages → Create Application → Hello World → Deploy.
-
-            ۲. کد Worker (فایل cloudflare-worker.js) رو داخل Edit code جایگزین کنید و Deploy بزنید.
-
-            ۳. کلید AUTH_KEY بسازید: همینجا دکمه‌ی «ساخت کلید تصادفی و کپی» رو بزنید.
-
-            ۴. توی Cloudflare: Settings → Variables and Secrets → Add → Type: Secret → Name: AUTH_KEY → Value: کلیدی که کپی کردید → Deploy.
-
-            ۵. برای فعال شدن Durable Object (لازم برای پایدار موندن اتصال)، باید wrangler.toml و ورک‌فلوی GitHub Actions رو هم دیپلوی کنید — یه ریپوی گیت‌هاب بسازید، فایل‌های پروژه رو push کنید، دو تا Secret به اسم CLOUDFLARE_API_TOKEN و CLOUDFLARE_ACCOUNT_ID به ریپو اضافه کنید (از پنل Cloudflare قابل ساختن‌ان)، و ورک‌فلوی Deploy Cloudflare Worker رو اجرا کنید.
-
-            ۶. apk اپ رو هم از همون ریپو با ورک‌فلوی Build APK بسازید و نصب کنید.
-
-            ۷. توی همین صفحه: آدرس Worker (بدون https و بدون /apiws) و کلید مشترک رو وارد کنید، «فعال کردن» بزنید، بعد «باز کردن در تلگرام» رو بزنید.
-
-            جزئیات کامل‌تر توی فایل README.md همین پروژه هست.
-        """.trimIndent()
-
-        AlertDialog.Builder(this)
-            .setTitle("راهنمای کامل تنظیم")
-            .setMessage(message)
-            .setPositiveButton("متوجه شدم", null)
-            .show()
     }
 
     override fun onStart() {
