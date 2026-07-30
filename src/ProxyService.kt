@@ -242,6 +242,12 @@ class ProxyService : Service() {
         val closed = AtomicBoolean(false)
 
         val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (midSessionErrorShown.getAndSet(false)) {
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm?.notify(NOTIF_ID, buildNotification("فعال است — 127.0.0.1:$localPort"))
+                }
+            }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 try {
                     val real = unwrapPadding(bytes.toByteArray())
@@ -258,9 +264,8 @@ class ProxyService : Service() {
                 closeAll(closed, socket, webSocket)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (code != 1000) {
-                    reportConnectionFailure(null, "اتصال Worker به تلگرام قطع شد (کد $code${if (reason.isNotEmpty()) " - $reason" else ""})")
-                }
+                // هر بستن اتصالی خطا نیست — تلگرام به‌طور طبیعی مدام اتصال‌های
+                // متعدد باز و بسته می‌کنه، پس اینجا چیزی گزارش نمی‌کنیم.
                 closeAll(closed, socket, webSocket)
             }
         })
