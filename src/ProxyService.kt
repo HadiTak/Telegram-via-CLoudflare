@@ -3,6 +3,7 @@ package ir.biral.tgrelay
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Build
@@ -228,8 +229,8 @@ class ProxyService : Service() {
         mainHandler.post {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
-        val nm = getSystemService(NotificationManager::class.java)
-        nm?.notify(NOTIF_ID, buildNotification("خطا: $message"))
+        // توجه: عمداً نوتیفیکیشن دائمی رو دست‌کاری نمی‌کنیم — چون این خطا فقط
+        // مربوط به یه اتصال تکیه، نه کل سرویس، و تلگرام معمولاً خودش دوباره امتحان می‌کنه.
     }
 
     private fun relayThroughWorker(destHost: String, socket: Socket, input: InputStream, output: OutputStream) {
@@ -243,10 +244,7 @@ class ProxyService : Service() {
 
         val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (midSessionErrorShown.getAndSet(false)) {
-                    val nm = getSystemService(NotificationManager::class.java)
-                    nm?.notify(NOTIF_ID, buildNotification("فعال است — 127.0.0.1:$localPort"))
-                }
+                midSessionErrorShown.set(false)
             }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 try {
@@ -293,16 +291,15 @@ class ProxyService : Service() {
         val message = overrideMessage ?: when (response?.code) {
             403 -> "کلید مشترک اشتباهه — با کلید AUTH_KEY توی Cloudflare یکی نیست"
             404 -> "آدرس Worker درست نیست یا مسیر /apiws پیدا نشد"
-            null -> "اتصال به Worker برقرار نشد — آدرس Worker یا اینترنت رو چک کن"
+            null -> "یه اتصال به Worker برقرار نشد — اگه تلگرام کار می‌کنه، نگران نباشید (تلگرام خودش دوباره امتحان می‌کنه)"
             else -> "خطا از سمت Worker (کد ${response.code})"
         }
 
         mainHandler.post {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
-
-        val nm = getSystemService(NotificationManager::class.java)
-        nm?.notify(NOTIF_ID, buildNotification("خطا: $message"))
+        // توجه: نوتیفیکیشن دائمی رو عمداً دست‌کاری نمی‌کنیم — این خطا مربوط به یه
+        // اتصال تکیه (تلگرام چندتا اتصال موازی داره)، نه قطعی کل سرویس.
     }
 
     private fun closeAll(closed: AtomicBoolean, socket: Socket, ws: WebSocket) {
@@ -328,10 +325,22 @@ class ProxyService : Service() {
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
+
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val piFlags = if (Build.VERSION.SDK_INT >= 23) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val contentIntent = PendingIntent.getActivity(this, 0, openAppIntent, piFlags)
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TG Relay")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+            .setContentIntent(contentIntent)
             .setOngoing(true)
             .build()
     }
