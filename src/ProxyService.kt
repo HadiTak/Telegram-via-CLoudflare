@@ -172,6 +172,7 @@ class ProxyService : Service() {
 
     private fun handleClient(socket: Socket) {
         try {
+            try { socket.tcpNoDelay = true } catch (_: Exception) {}
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
@@ -270,7 +271,7 @@ class ProxyService : Service() {
 
         pool.execute {
             try {
-                val buf = ByteArray(8192)
+                val buf = ByteArray(65536)
                 while (!closed.get()) {
                     val n = input.read(buf)
                     if (n == -1) break

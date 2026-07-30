@@ -71,8 +71,10 @@ export default {
 
 		// هر اتصال یه Durable Object جدا و مخصوص خودش می‌گیره تا بتونه
 		// مستقل از محدودیت زمانی fetch معمولی، زنده بمونه.
+		// locationHint: نزدیک‌ترین منطقه‌ی Cloudflare به ایران (خاورمیانه)
+		// رو انتخاب می‌کنه تا تأخیر رفت‌وبرگشت کمتر بشه.
 		const id = env.RELAY.newUniqueId();
-		const stub = env.RELAY.get(id);
+		const stub = env.RELAY.get(id, { locationHint: "me" });
 		return stub.fetch(request);
 	},
 };
