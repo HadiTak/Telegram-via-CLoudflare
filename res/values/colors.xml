@@ -1,0 +1,24 @@
+<resources>
+    <color name="bg_top">#2E86FF</color>
+    <color name="bg_bottom">#0A2755</color>
+
+    <color name="glass_fill">#26FFFFFF</color>
+    <color name="glass_stroke">#55FFFFFF</color>
+
+    <color name="input_fill">#1AFFFFFF</color>
+    <color name="input_stroke">#40FFFFFF</color>
+
+    <color name="accent_gold">#FFC94A</color>
+    <color name="accent_gold_dark">#E0A93E</color>
+
+    <color name="danger">#FF5D5D</color>
+    <color name="danger_dark">#D64545</color>
+
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#CCFFFFFF</color>
+    <color name="text_hint">#80FFFFFF</color>
+
+    <color name="dot_running">#4CD964</color>
+    <color name="dot_connecting">#FFC94A</color>
+    <color name="dot_stopped">#99FFFFFF</color>
+</resources>

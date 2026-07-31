@@ -1,19 +1,25 @@
 package ir.biral.tgrelay
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
@@ -23,11 +29,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etPort: EditText
     private lateinit var btnToggle: Button
     private lateinit var btnOpenTelegram: Button
+    private lateinit var btnHelp: Button
+    private lateinit var btnGenKey: Button
     private lateinit var tvStatus: TextView
+    private lateinit var dotStatus: View
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        if (Build.VERSION.SDK_INT >= 21) {
+            window.statusBarColor = ContextCompat.getColor(this, R.color.bg_top)
+        }
 
         prefs = getSharedPreferences("tgrelay", MODE_PRIVATE)
         etKey = findViewById(R.id.etKey)
@@ -35,7 +48,10 @@ class MainActivity : AppCompatActivity() {
         etPort = findViewById(R.id.etPort)
         btnToggle = findViewById(R.id.btnToggle)
         btnOpenTelegram = findViewById(R.id.btnOpenTelegram)
+        btnHelp = findViewById(R.id.btnHelp)
+        btnGenKey = findViewById(R.id.btnGenKey)
         tvStatus = findViewById(R.id.tvStatus)
+        dotStatus = findViewById(R.id.dotStatus)
 
         etKey.setText(prefs.getString("key", ""))
         etWorker.setText(prefs.getString("worker", ""))
@@ -43,6 +59,8 @@ class MainActivity : AppCompatActivity() {
 
         btnToggle.setOnClickListener { onToggleClicked() }
         btnOpenTelegram.setOnClickListener { openInTelegram() }
+        btnHelp.setOnClickListener { showHelp() }
+        btnGenKey.setOnClickListener { generateKey() }
     }
 
     override fun onStart() {
@@ -57,13 +75,50 @@ class MainActivity : AppCompatActivity() {
         ProxyService.listener = null
     }
 
+    private fun generateKey() {
+        val bytes = ByteArray(32)
+        SecureRandom().nextBytes(bytes)
+        val key = bytes.joinToString("") { "%02x".format(it) }
+        etKey.setText(key)
+
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("AUTH_KEY", key))
+
+        Toast.makeText(this, "کلید ساخته شد و کپی شد — حالا برو توی Cloudflare بهش بچسبونش", Toast.LENGTH_LONG).show()
+    }
+
+    private fun showHelp() {
+        val message = """
+            ۱. یه اکانت رایگان Cloudflare بسازید → Workers & Pages → Create Application → Hello World → Deploy.
+
+            ۲. کد Worker (فایل cloudflare-worker.js) رو داخل Edit code جایگزین کنید و Deploy بزنید.
+
+            ۳. کلید AUTH_KEY بسازید: همینجا دکمه‌ی «ساخت کلید تصادفی و کپی» رو بزنید.
+
+            ۴. توی Cloudflare: Settings → Variables and Secrets → Add → Type: Secret → Name: AUTH_KEY → Value: کلیدی که کپی کردید → Deploy.
+
+            ۵. برای فعال شدن Durable Object (لازم برای پایدار موندن اتصال)، باید wrangler.toml و ورک‌فلوی GitHub Actions رو هم دیپلوی کنید — یه ریپوی گیت‌هاب بسازید، فایل‌های پروژه رو push کنید، دو تا Secret به اسم CLOUDFLARE_API_TOKEN و CLOUDFLARE_ACCOUNT_ID به ریپو اضافه کنید (از پنل Cloudflare قابل ساختن‌ان)، و ورک‌فلوی Deploy Cloudflare Worker رو اجرا کنید.
+
+            ۶. apk اپ رو هم از همون ریپو با ورک‌فلوی Build APK بسازید و نصب کنید.
+
+            ۷. توی همین صفحه: آدرس Worker (بدون https و بدون /apiws) و کلید مشترک رو وارد کنید، «فعال کردن» بزنید، بعد «باز کردن در تلگرام» رو بزنید.
+
+            جزئیات کامل‌تر توی فایل README.md همین پروژه هست.
+        """.trimIndent()
+
+        AlertDialog.Builder(this)
+            .setTitle("راهنمای کامل تنظیم")
+            .setMessage(message)
+            .setPositiveButton("متوجه شدم", null)
+            .show()
+    }
+
     private fun openInTelegram() {
         if (ProxyService.state != ProxyService.State.RUNNING) {
             Toast.makeText(this, "اول دکمه «فعال کردن» رو بزن و صبر کن وضعیت فعال بشه", Toast.LENGTH_SHORT).show()
             return
         }
         val port = etPort.text.toString().trim().ifEmpty { "1080" }
-        // Telegram's own proxy deep-link scheme: pre-fills the add-proxy dialog.
         val tgUri = Uri.parse("tg://socks?server=127.0.0.1&port=$port")
         val webUri = Uri.parse("https://t.me/socks?server=127.0.0.1&port=$port")
         try {
@@ -133,19 +188,28 @@ class MainActivity : AppCompatActivity() {
         when (ProxyService.state) {
             ProxyService.State.RUNNING -> {
                 val port = prefs.getString("port", "1080")
-                tvStatus.text = "وضعیت: فعال ✅  (SOCKS5 روی 127.0.0.1:$port)"
+                tvStatus.text = "فعال — 127.0.0.1:$port"
+                dotStatus.backgroundTintList = ContextCompat.getColorStateList(this, R.color.dot_running)
                 btnToggle.text = "غیرفعال کردن"
                 btnToggle.isEnabled = true
+                btnToggle.background = ContextCompat.getDrawable(this, R.drawable.bg_button_danger)
+                btnToggle.setTextColor(ContextCompat.getColor(this, R.color.text_primary))
             }
             ProxyService.State.CONNECTING -> {
-                tvStatus.text = "وضعیت: در حال بررسی کلید و اتصال..."
+                tvStatus.text = "در حال بررسی کلید و اتصال..."
+                dotStatus.backgroundTintList = ContextCompat.getColorStateList(this, R.color.dot_connecting)
                 btnToggle.text = "در حال بررسی..."
                 btnToggle.isEnabled = false
+                btnToggle.background = ContextCompat.getDrawable(this, R.drawable.bg_button_primary)
+                btnToggle.setTextColor(android.graphics.Color.parseColor("#1B1B1B"))
             }
             ProxyService.State.STOPPED -> {
-                tvStatus.text = "وضعیت: غیرفعال"
+                tvStatus.text = "غیرفعال"
+                dotStatus.backgroundTintList = ContextCompat.getColorStateList(this, R.color.dot_stopped)
                 btnToggle.text = "فعال کردن"
                 btnToggle.isEnabled = true
+                btnToggle.background = ContextCompat.getDrawable(this, R.drawable.bg_button_primary)
+                btnToggle.setTextColor(android.graphics.Color.parseColor("#1B1B1B"))
             }
         }
     }
