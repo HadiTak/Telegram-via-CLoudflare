@@ -11,7 +11,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="TG Relay"
+        android:label="TG Relay CF"
         android:theme="@style/Theme.AppCompat.NoActionBar"
         android:supportsRtl="true">
 

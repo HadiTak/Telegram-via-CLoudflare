@@ -43,9 +43,19 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            storeFile file('release.keystore')
+            storePassword 'tgrelay2026'
+            keyAlias 'tgrelay'
+            keyPassword 'tgrelay2026'
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
         debug {
             minifyEnabled false

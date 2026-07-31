@@ -17,7 +17,7 @@
             android:layout_gravity="center_horizontal"
             android:layout_marginTop="12dp"
             android:layout_marginBottom="20dp"
-            android:text="TG Relay"
+            android:text="TG Relay CF"
             android:textColor="@color/text_primary"
             android:textSize="26sp"
             android:textStyle="bold" />
@@ -55,19 +55,6 @@
                     android:textSize="16sp"
                     android:textStyle="bold" />
             </LinearLayout>
-
-            <Button
-                android:id="@+id/btnHelp"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="18dp"
-                android:background="@drawable/bg_button_outline"
-                android:paddingTop="12dp"
-                android:paddingBottom="12dp"
-                android:text="📘 راهنمای کامل تنظیم"
-                android:textAllCaps="false"
-                android:textColor="@color/text_primary"
-                android:elevation="0dp" />
 
             <TextView
                 android:layout_width="wrap_content"

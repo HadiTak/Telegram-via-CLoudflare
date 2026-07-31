@@ -50,6 +50,7 @@ class ProxyService : Service() {
         const val CHANNEL_ID = "tgrelay_channel"
         const val NOTIF_ID = 1
         const val MAX_PAD = 63
+        const val ACTION_STOP = "ir.biral.tgrelay.ACTION_STOP"
 
         private val stateHandler = Handler(Looper.getMainLooper())
 
@@ -89,6 +90,13 @@ class ProxyService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            setState(State.STOPPED)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         workerHost = intent?.getStringExtra("worker") ?: return START_NOT_STICKY
         localPort = intent.getIntExtra("port", 1080)
         authKey = intent.getStringExtra("key") ?: ""
@@ -114,7 +122,7 @@ class ProxyService : Service() {
                     setState(State.RUNNING)
                     mainHandler.post {
                         val nm = getSystemService(NotificationManager::class.java)
-                        nm?.notify(NOTIF_ID, buildNotification("فعال است — 127.0.0.1:$localPort"))
+                        nm?.notify(NOTIF_ID, buildNotification("فعال است — 127.0.0.1:$localPort", showStopAction = true))
                     }
                     runServer()
                     return
@@ -320,9 +328,9 @@ class ProxyService : Service() {
         return off
     }
 
-    private fun buildNotification(text: String): Notification {
+    private fun buildNotification(text: String, showStopAction: Boolean = false): Notification {
         if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel(CHANNEL_ID, "TG Relay", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(CHANNEL_ID, "TG Relay CF", NotificationManager.IMPORTANCE_LOW)
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
@@ -337,13 +345,20 @@ class ProxyService : Service() {
         }
         val contentIntent = PendingIntent.getActivity(this, 0, openAppIntent, piFlags)
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("TG Relay")
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("TG Relay CF")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(contentIntent)
             .setOngoing(true)
-            .build()
+
+        if (showStopAction) {
+            val stopIntent = Intent(this, ProxyService::class.java).apply { action = ACTION_STOP }
+            val stopPendingIntent = PendingIntent.getService(this, 1, stopIntent, piFlags)
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "قطع اتصال", stopPendingIntent)
+        }
+
+        return builder.build()
     }
 
     override fun onDestroy() {
