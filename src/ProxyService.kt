@@ -27,6 +27,7 @@ import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
 
 /**
@@ -35,9 +36,10 @@ import kotlin.random.Random
  * Worker over a WebSocket (wss://, never filtered), and the Worker opens the
  * real TCP connection to Telegram's servers on our behalf.
  *
- * هر پیام قبل از ارسال یه padding تصادفی کوچیک می‌گیره تا اندازه‌ی بسته‌ها
- * (که می‌تونه امضای MTProto رو لو بده) نامنظم بشه. این padding فقط روی لینک
- * app<->worker اضافه می‌شه و قبل از رسیدن به تلگرام حذف می‌شه.
+ * Each message gets a small random padding before being sent, so packet
+ * sizes (which could reveal the MTProto signature) become irregular. This
+ * padding only exists on the app<->worker link and is stripped before it
+ * reaches Telegram.
  */
 class ProxyService : Service() {
 
@@ -51,6 +53,12 @@ class ProxyService : Service() {
         const val NOTIF_ID = 1
         const val MAX_PAD = 63
         const val ACTION_STOP = "ir.biral.tgrelay.ACTION_STOP"
+
+        // How many parallel connection attempts we race per single Telegram connection.
+        // Higher = faster/more resilient against occasional Cloudflare hiccups, but more
+        // Durable Object / TCP socket usage per connection. 3 is a reasonable balance;
+        // feel free to raise it if you want to trade more resource usage for more speed.
+        const val RACE_COUNT = 3
 
         private val stateHandler = Handler(Looper.getMainLooper())
 
@@ -78,6 +86,8 @@ class ProxyService : Service() {
     }
 
     private var serverSocket: ServerSocket? = null
+    private val activeSockets = java.util.Collections.synchronizedSet(mutableSetOf<Socket>())
+    private val activeWebSockets = java.util.Collections.synchronizedSet(mutableSetOf<WebSocket>())
     private val pool = Executors.newCachedThreadPool()
     private val httpClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -88,6 +98,7 @@ class ProxyService : Service() {
     private var localPort: Int = 1080
     private var authKey: String = ""
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val everConnected = AtomicBoolean(false)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -102,14 +113,14 @@ class ProxyService : Service() {
         authKey = intent.getStringExtra("key") ?: ""
 
         setState(State.CONNECTING)
-        startForeground(NOTIF_ID, buildNotification("در حال بررسی کلید و اتصال..."))
+        startForeground(NOTIF_ID, buildNotification("Checking key and connection..."))
 
         pool.execute { verifyThenStart() }
 
         return START_STICKY
     }
 
-    /** قبل از هر چیز، یه درخواست ساده به /check می‌فرسته تا مطمئن بشه کلید و آدرس درستن. */
+    /** Before anything else, sends a simple request to /check to make sure the key and address are correct. */
     private fun verifyThenStart() {
         val checkUrl = "https://$workerHost/check"
         try {
@@ -120,24 +131,47 @@ class ProxyService : Service() {
             httpClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
                     setState(State.RUNNING)
+                    everConnected.set(false)
                     mainHandler.post {
                         val nm = getSystemService(NotificationManager::class.java)
-                        nm?.notify(NOTIF_ID, buildNotification("فعال است — 127.0.0.1:$localPort", showStopAction = true))
+                        nm?.notify(NOTIF_ID, buildNotification("Active — 127.0.0.1:$localPort", showStopAction = true))
                     }
+                    scheduleNoConnectionWatchdog()
                     runServer()
                     return
                 }
                 failAndStop(messageFor(resp.code))
             }
         } catch (e: Exception) {
-            failAndStop("اتصال به Worker برقرار نشد — آدرس Worker یا اینترنت رو چک کن")
+            failAndStop("Could not connect to the Worker -- check the Worker address or your internet")
         }
     }
 
     private fun messageFor(code: Int): String = when (code) {
-        403 -> "کلید مشترک اشتباهه — با کلید AUTH_KEY توی Cloudflare یکی نیست"
-        404 -> "آدرس Worker درست نیست یا این نسخه از Worker رو دیپلوی نکردید"
-        else -> "خطا از سمت Worker (کد $code)"
+        403 -> "Wrong shared key -- it does not match the AUTH_KEY set in Cloudflare"
+        404 -> "Worker address is wrong, or this version of the Worker has not been deployed yet"
+        else -> "Error from the Worker (code $code)"
+    }
+
+    /**
+     * Instead of alerting on every single failed relay attempt (Telegram opens many
+     * parallel connections, so isolated failures are normal and self-recovering),
+     * we wait 15 seconds and only warn if genuinely NOT ONE connection has succeeded
+     * in that time -- that's the only situation actually worth interrupting the user for.
+     */
+    private fun scheduleNoConnectionWatchdog() {
+        mainHandler.postDelayed({
+            if (state == State.RUNNING && !everConnected.get()) {
+                val nm = getSystemService(NotificationManager::class.java)
+                nm?.notify(
+                    NOTIF_ID,
+                    buildNotification(
+                        "No connection to Telegram yet after 15 seconds. Double-check the Worker address and key, and make sure the proxy is selected in Telegram's settings.",
+                        showStopAction = true
+                    )
+                )
+            }
+        }, 15000)
     }
 
     private fun failAndStop(message: String) {
@@ -157,24 +191,26 @@ class ProxyService : Service() {
             serverSocket = s
             while (state == State.RUNNING) {
                 val client = s.accept()
+                activeSockets.add(client)
                 pool.execute { handleClient(client) }
             }
         } catch (e: Exception) {
             if (state == State.RUNNING) {
-                // این یعنی سرور SOCKS5 محلی واقعاً نتونست بالا بیاد (مثلاً پورت قبلاً اشغال بوده)
-                // ولی وضعیت اشتباهاً "فعال" مونده بود؛ اینجا درستش می‌کنیم.
+                // This means the local SOCKS5 server actually failed to start (e.g. the port
+                // was already in use), but the state had been wrongly left as "running" --
+                // fix that here.
                 setState(State.STOPPED)
                 mainHandler.post {
                     Toast.makeText(
                         this,
-                        "سرور محلی SOCKS5 بالا نیومد (پورت $localPort شاید قبلاً استفاده شده) — ${e.message}",
+                        "Local SOCKS5 server failed to start (port $localPort might already be in use) -- ${e.message}",
                         Toast.LENGTH_LONG
                     ).show()
                 }
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
-            // else: عادیه، یعنی خودمون داشتیم سرویس رو متوقف می‌کردیم
+            // else: this is normal, it means we were the ones stopping the service
         }
     }
 
@@ -186,7 +222,7 @@ class ProxyService : Service() {
 
             // SOCKS5 greeting
             val greeting = ByteArray(2)
-            if (readFully(input, greeting) != 2) { socket.close(); return }
+            if (readFully(input, greeting) != 2) { closeSocket(socket); return }
             val nMethods = greeting[1].toInt() and 0xFF
             val methods = ByteArray(nMethods)
             readFully(input, methods)
@@ -195,7 +231,7 @@ class ProxyService : Service() {
 
             // SOCKS5 connect request
             val head = ByteArray(4)
-            if (readFully(input, head) != 4) { socket.close(); return }
+            if (readFully(input, head) != 4) { closeSocket(socket); return }
             val atyp = head[3].toInt() and 0xFF
 
             val destHost: String = when (atyp) {
@@ -213,8 +249,8 @@ class ProxyService : Service() {
                     java.net.InetAddress.getByAddress(a).hostAddress
                 }
                 else -> {
-                    reportLocalError("درخواست SOCKS5 ناشناخته (ATYP=$atyp) — تلگرام رد شد")
-                    socket.close(); return
+                    reportLocalError("Unknown SOCKS5 request (ATYP=$atyp) -- rejected")
+                    closeSocket(socket); return
                 }
             }
             val portBytes = ByteArray(2)
@@ -227,94 +263,154 @@ class ProxyService : Service() {
             relayThroughWorker(destHost, socket, input, output)
 
         } catch (e: Exception) {
-            reportLocalError("درخواست محلی SOCKS5 با خطا مواجه شد: ${e.message}")
-            try { socket.close() } catch (_: Exception) {}
+            reportLocalError("Local SOCKS5 request failed: ${e.message}")
+            closeSocket(socket)
         }
     }
 
-    /** برای خطاهایی که قبل از رسیدن به Worker (توی همون SOCKS5 محلی) اتفاق می‌افتن. */
+    /** Closes the socket and removes it from the active-connections list. */
+    private fun closeSocket(socket: Socket) {
+        try { socket.close() } catch (_: Exception) {}
+        activeSockets.remove(socket)
+    }
+
+    /** For errors that happen before reaching the Worker (in the local SOCKS5 layer itself). */
     private fun reportLocalError(message: String) {
         if (!midSessionErrorShown.compareAndSet(false, true)) return
         mainHandler.post {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
-        // توجه: عمداً نوتیفیکیشن دائمی رو دست‌کاری نمی‌کنیم — چون این خطا فقط
-        // مربوط به یه اتصال تکیه، نه کل سرویس، و تلگرام معمولاً خودش دوباره امتحان می‌کنه.
+        // Note: we deliberately don't touch the persistent notification here -- this
+        // error only concerns a single connection, not the whole service, and
+        // Telegram usually just retries on its own.
     }
 
+    /**
+     * Opens up to RACE_COUNT parallel WebSocket connection attempts to the Worker for this
+     * single Telegram connection. Whichever one successfully opens first "wins" and is used
+     * for the whole session; every other (slower or failed) attempt is cancelled immediately.
+     * This speeds up connection establishment and makes each connection more resilient to
+     * occasional transient Cloudflare errors, since one bad attempt no longer means the whole
+     * connection has to be retried from scratch by Telegram.
+     */
     private fun relayThroughWorker(destHost: String, socket: Socket, input: InputStream, output: OutputStream) {
         val encodedDst = java.net.URLEncoder.encode(destHost, "UTF-8")
         val url = "wss://$workerHost/apiws?dst=$encodedDst"
-        val request = Request.Builder()
-            .url(url)
-            .addHeader("X-Auth-Key", authKey)
-            .build()
         val closed = AtomicBoolean(false)
+        val winner = AtomicReference<WebSocket>(null)
+        val pumpStarted = AtomicBoolean(false)
+        val racers = java.util.Collections.synchronizedSet(mutableSetOf<WebSocket>())
 
-        val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                midSessionErrorShown.set(false)
+        fun discard(ws: WebSocket) {
+            try { ws.cancel() } catch (_: Exception) {}
+            activeWebSockets.remove(ws)
+            racers.remove(ws)
+        }
+
+        fun startPump(ws: WebSocket) {
+            if (!pumpStarted.compareAndSet(false, true)) return
+            // this racer won -- immediately drop every other attempt for this connection
+            synchronized(racers) {
+                for (r in racers.toList()) if (r !== ws) discard(r)
             }
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            pool.execute {
                 try {
-                    val real = unwrapPadding(bytes.toByteArray())
-                    if (real.isNotEmpty()) {
-                        output.write(real)
-                        output.flush()
+                    val buf = ByteArray(65536)
+                    while (!closed.get()) {
+                        val n = input.read(buf)
+                        if (n == -1) break
+                        ws.send(wrapWithPadding(buf.copyOf(n)).toByteString())
                     }
                 } catch (_: Exception) {
-                    closeAll(closed, socket, webSocket)
+                } finally {
+                    closeAll(closed, socket, ws)
                 }
             }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                reportConnectionFailure(response)
-                closeAll(closed, socket, webSocket)
-            }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                // هر بستن اتصالی خطا نیست — تلگرام به‌طور طبیعی مدام اتصال‌های
-                // متعدد باز و بسته می‌کنه، پس اینجا چیزی گزارش نمی‌کنیم.
-                closeAll(closed, socket, webSocket)
-            }
-        })
+        }
 
-        pool.execute {
-            try {
-                val buf = ByteArray(65536)
-                while (!closed.get()) {
-                    val n = input.read(buf)
-                    if (n == -1) break
-                    ws.send(wrapWithPadding(buf.copyOf(n)).toByteString())
+        repeat(RACE_COUNT) {
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("X-Auth-Key", authKey)
+                .build()
+            val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    midSessionErrorShown.set(false)
+                    if (winner.compareAndSet(null, webSocket)) {
+                        startPump(webSocket)
+                    } else {
+                        discard(webSocket) // another racer already won
+                    }
                 }
-            } catch (_: Exception) {
-            } finally {
-                closeAll(closed, socket, ws)
-            }
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    if (winner.get() !== webSocket) return // stray data from a discarded loser
+                    everConnected.set(true)
+                    try {
+                        val real = unwrapPadding(bytes.toByteArray())
+                        if (real.isNotEmpty()) {
+                            output.write(real)
+                            output.flush()
+                        }
+                    } catch (_: Exception) {
+                        closeAll(closed, socket, webSocket)
+                    }
+                }
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (winner.get() === webSocket) {
+                        // A single failed connection attempt isn't worth interrupting the user for --
+                        // Telegram opens several in parallel and retries on its own. We only alert
+                        // immediately for actionable config errors (wrong key / wrong address);
+                        // anything else is left to the 15-second watchdog, which only fires if
+                        // NOT ONE connection has ever succeeded.
+                        if (response?.code == 403 || response?.code == 404) {
+                            reportConnectionFailure(response)
+                        }
+                        closeAll(closed, socket, webSocket)
+                    } else {
+                        discard(webSocket)
+                    }
+                }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    if (winner.get() === webSocket) {
+                        // Not every close is an error -- Telegram routinely opens and closes many
+                        // parallel connections, so we don't report anything here.
+                        closeAll(closed, socket, webSocket)
+                    } else {
+                        discard(webSocket)
+                    }
+                }
+            })
+            activeWebSockets.add(ws)
+            racers.add(ws)
         }
     }
 
     private val midSessionErrorShown = AtomicBoolean(false)
 
     private fun reportConnectionFailure(response: Response?, overrideMessage: String? = null) {
-        if (!midSessionErrorShown.compareAndSet(false, true)) return // فقط یه‌بار در هر فعال‌سازی
+        if (!midSessionErrorShown.compareAndSet(false, true)) return // only once per activation
 
         val message = overrideMessage ?: when (response?.code) {
-            403 -> "کلید مشترک اشتباهه — با کلید AUTH_KEY توی Cloudflare یکی نیست"
-            404 -> "آدرس Worker درست نیست یا مسیر /apiws پیدا نشد"
-            null -> "یه اتصال به Worker برقرار نشد — اگه تلگرام کار می‌کنه، نگران نباشید (تلگرام خودش دوباره امتحان می‌کنه)"
-            else -> "خطا از سمت Worker (کد ${response.code})"
+            403 -> "Wrong shared key -- it does not match the AUTH_KEY set in Cloudflare"
+            404 -> "Worker address is wrong, or the /apiws path was not found"
+            null -> "A connection to the Worker failed -- if Telegram is still working, do not worry, it usually retries on its own"
+            else -> "Error from the Worker (code ${response.code})"
         }
 
         mainHandler.post {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
-        // توجه: نوتیفیکیشن دائمی رو عمداً دست‌کاری نمی‌کنیم — این خطا مربوط به یه
-        // اتصال تکیه (تلگرام چندتا اتصال موازی داره)، نه قطعی کل سرویس.
+        // Note: we deliberately don't touch the persistent notification -- this error
+        // is about a single connection (Telegram keeps several in parallel), not
+        // the whole service going down.
     }
 
     private fun closeAll(closed: AtomicBoolean, socket: Socket, ws: WebSocket) {
         if (closed.compareAndSet(false, true)) {
             try { ws.close(1000, null) } catch (_: Exception) {}
             try { socket.close() } catch (_: Exception) {}
+            activeSockets.remove(socket)
+            activeWebSockets.remove(ws)
         }
     }
 
@@ -348,6 +444,7 @@ class ProxyService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("TG Relay CF")
             .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(contentIntent)
             .setOngoing(true)
@@ -355,7 +452,7 @@ class ProxyService : Service() {
         if (showStopAction) {
             val stopIntent = Intent(this, ProxyService::class.java).apply { action = ACTION_STOP }
             val stopPendingIntent = PendingIntent.getService(this, 1, stopIntent, piFlags)
-            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "قطع اتصال", stopPendingIntent)
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPendingIntent)
         }
 
         return builder.build()
@@ -364,6 +461,24 @@ class ProxyService : Service() {
     override fun onDestroy() {
         setState(State.STOPPED)
         try { serverSocket?.close() } catch (_: Exception) {}
+
+        // Important: up to this point we've only blocked *new* connections. Any
+        // connections that were already established (Telegram's current session)
+        // must be explicitly closed too, or they'll keep working as if nothing
+        // was ever stopped.
+        synchronized(activeSockets) {
+            for (s in activeSockets) {
+                try { s.close() } catch (_: Exception) {}
+            }
+            activeSockets.clear()
+        }
+        synchronized(activeWebSockets) {
+            for (w in activeWebSockets) {
+                try { w.cancel() } catch (_: Exception) {} // cancel = immediate teardown, no waiting for the close handshake
+            }
+            activeWebSockets.clear()
+        }
+
         pool.shutdownNow()
         super.onDestroy()
     }
